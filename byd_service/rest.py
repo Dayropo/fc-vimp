@@ -423,6 +423,34 @@ class RESTServices:
 			logger.error(f"Error fetching location {location_id}: {str(e)}")
 			raise
 
+	def _enrich_delivery_items(self, delivery: dict) -> dict:
+		'''
+			Attach product details and material-valuation pricing to each line item
+			of an outbound-delivery dict returned by ByD.
+		'''
+		if not delivery or "Item" not in delivery:
+			return delivery
+		items = delivery["Item"]
+		if isinstance(items, dict):
+			items = items.get("results", [])
+		if isinstance(items, list):
+			for item in items:
+				material_id = item.get("ProductID") or item.get("ItemProduct", {}).get("ProductID")
+				if not material_id:
+					continue
+				product_details = self.get_product_details(material_id)
+				if product_details:
+					item.update(product_details)
+
+				# Get pricing from material valuation
+				material_valuation = self.get_material_valuation(material_id)
+				if material_valuation:
+					item["unit_price"] = material_valuation.get("unit_price", 0)
+					item["currency_code"] = material_valuation.get("currency_code", "NGN")
+					item["valuation_date"] = material_valuation.get("valuation_date")
+			delivery["Item"] = items
+		return delivery
+
 	def get_delivery_by_id(self, delivery_id: str) -> dict:
 		'''
 			Fetch an outbound delivery (warehouse-to-store) from SAP ByD by ID
@@ -437,33 +465,46 @@ class RESTServices:
 				response_json = json.loads(response.text)
 				results = response_json["d"]["results"]
 				delivery = results[0] if results else None
-				if delivery and "Item" in delivery:
-					items = delivery["Item"]
-					if isinstance(items, dict):
-						items = items.get("results", [])
-					if isinstance(items, list):
-						for item in items:
-							material_id = item.get("ProductID") or item.get("ItemProduct", {}).get("ProductID")
-							if material_id:
-								product_details = self.get_product_details(material_id)
-								if product_details:
-									item.update(product_details)
-
-								# Get pricing from material valuation
-								material_valuation = self.get_material_valuation(material_id)
-								if material_valuation:
-									item["unit_price"] = material_valuation.get("unit_price", 0)
-									item["currency_code"] = material_valuation.get("currency_code", "NGN")
-									item["valuation_date"] = material_valuation.get("valuation_date")
-						delivery["Item"] = items
-				return delivery
+				return self._enrich_delivery_items(delivery)
 			else:
 				logger.error(f"Failed to fetch delivery {delivery_id}: {response.text}")
 				return None
 		except Exception as e:
 			logger.error(f"Error fetching delivery {delivery_id}: {str(e)}")
 			raise
-	
+
+	def get_deliveries_by_sales_order(self, sales_order_id: str) -> list:
+		'''
+			Fetch warehouse->store outbound deliveries from SAP ByD that originate
+			from the given sales order.
+
+			The sales-order property on OutboundDeliveryCollection is not confirmed
+			for this tenant, so we try a server-side $filter on the assumed property
+			(SalesOrderID) first and, if ByD rejects it, fall back to a direct ID
+			lookup (the STOD outbound-delivery ID has been observed to equal the
+			sales-order number for these transfers). A rejected filter is logged
+			with ByD's response so the real property name can be pinned down.
+		'''
+		base = (f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/OutboundDeliveryCollection?$format=json"
+				f"&$expand=Item/ItemDeliveryQuantity,ProductRecipientParty/ProductRecipientDisplayName,"
+				f"ShipFromLocation,ShippingPeriod,ArrivalPeriod")
+		filter_url = f"{base}&$filter=SalesOrderID eq '{sales_order_id}'"
+		try:
+			response = self.__get__(filter_url)
+			if response.status_code == 200:
+				results = json.loads(response.text)["d"]["results"]
+				return [self._enrich_delivery_items(d) for d in results]
+			logger.warning(
+				f"OutboundDelivery $filter by SalesOrderID rejected by ByD for sales order "
+				f"{sales_order_id}; falling back to ID lookup. Response: {response.text}"
+			)
+		except Exception as e:
+			logger.warning(f"Error filtering OutboundDelivery by SalesOrderID for {sales_order_id}: {e}")
+
+		# Fallback: treat the sales-order number as the outbound-delivery ID.
+		delivery = self.get_delivery_by_id(sales_order_id)
+		return [delivery] if delivery else []
+
 	def search_deliveries_by_store(self, store_id: str, status: str = None) -> list:
 		'''
 			Search for outbound deliveries (warehouse-to-store) assigned to a specific store

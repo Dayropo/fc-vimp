@@ -244,8 +244,10 @@ def get_inbound_deliveries(request):
 @authentication_classes([CombinedAuthentication])
 def get_inbound_delivery(request, pk):
 	"""
-	Get details of a specific inbound delivery
-	If not found locally, try to fetch from SAP ByD
+	Get details of a specific inbound delivery, looked up by sales order
+	(mirrors egrn_service.get_purchase_order's single-identifier, local-then-ByD
+	pattern - `pk` here plays the role `po_id` plays there).
+	If not found locally, try to fetch from SAP ByD.
 
 	Query Parameters:
 	- refresh: If 'true', force refresh from SAP ByD and update existing record
@@ -257,32 +259,47 @@ def get_inbound_delivery(request, pk):
 		delivery = None
 
 		if not refresh:
-			try:
-				# Check if delivery exists locally
-				delivery = InboundDelivery.objects.get(delivery_id=pk)
-			except InboundDelivery.DoesNotExist:
-				pass
+			# A sales order maps to a single warehouse->store delivery; if that
+			# ever changes, take the most recent one.
+			delivery = (
+				InboundDelivery.objects
+				.filter(sales_order_reference=pk)
+				.order_by('-delivery_date', '-id')
+				.first()
+			)
 		# If refresh requested or delivery not found, fetch from SAP ByD
 		if refresh or delivery is None:
 			byd_rest = RESTServices()
-			delivery_data = byd_rest.get_delivery_by_id(pk)
-			if not delivery_data:
+
+			deliveries_data = byd_rest.get_deliveries_by_sales_order(pk)
+			if not deliveries_data:
 				return APIResponse(
 					status=status.HTTP_404_NOT_FOUND,
-					message=f"Delivery {pk} not found in SAP ByD"
+					message=f"No delivery found in SAP ByD for sales order {pk}"
 				)
+			if len(deliveries_data) > 1:
+				logger.warning(
+					f"Sales order {pk} returned {len(deliveries_data)} outbound deliveries; using the first"
+				)
+			delivery_data = deliveries_data[0]
 
 			# Delete any existing delivery with the same object_id to avoid duplicate key error
 			object_id = delivery_data.get("ObjectID")
 			if object_id:
 				InboundDelivery.objects.filter(object_id=object_id).delete()
 			elif delivery:
-				# Fallback: delete the delivery found by delivery_id
+				# Fallback: delete the delivery found locally
 				delivery.line_items.all().delete()
 				delivery.delete()
 
 			# Create delivery record with fresh data
 			delivery = InboundDelivery.create_from_byd_data(delivery_data)
+
+			# Ensure the sales-order lookup can hit the local cache next time even
+			# if ByD's outbound-delivery payload doesn't carry the sales-order id.
+			if not delivery.sales_order_reference:
+				delivery.sales_order_reference = str(pk)
+				delivery.save(update_fields=['sales_order_reference'])
 
 		# Authorized if user can access via destination store OR source warehouse
 		if not AuthorizationService.user_can_access_delivery(request.user, delivery):
