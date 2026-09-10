@@ -925,6 +925,16 @@ def sync_approved_receipt_to_sap(receipt_id: int):
 	Delegates to post_goods_receipt_on_byd() which handles the two-step
 	ByD flow: create Inbound Delivery Notification → PostGoodsReceipt.
 	Updates synced_to_sap on success.
+
+	TODO (eGRN 2 cutover, step 3): under the sales-order-anchored flow the store
+	receives against a Sales Order and NO outbound delivery exists yet. This task
+	must additionally create the Outbound Delivery in ByD for the confirmed
+	received quantity, then back-fill receipt.inbound_delivery.object_id /
+	.delivery_id from the response. RESTServices.create_outbound_delivery() is
+	written for this but deliberately not wired in yet - it is unverified whether
+	khoutbounddelivery/OutboundDeliveryCollection accepts a POST in this tenant.
+	Also open: whether the existing inbound notification + PostGoodsReceipt below
+	is still required once the outbound delivery is created, or is superseded by it.
 	"""
 	from transfer_service.models import TransferReceiptNote
 

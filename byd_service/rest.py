@@ -473,37 +473,30 @@ class RESTServices:
 			logger.error(f"Error fetching delivery {delivery_id}: {str(e)}")
 			raise
 
-	def get_deliveries_by_sales_order(self, sales_order_id: str) -> list:
+	def create_outbound_delivery(self, delivery_data: dict) -> dict:
 		'''
-			Fetch warehouse->store outbound deliveries from SAP ByD that originate
-			from the given sales order.
+			Create an Outbound Delivery in SAP ByD for the confirmed received quantity.
 
-			The sales-order property on OutboundDeliveryCollection is not confirmed
-			for this tenant, so we try a server-side $filter on the assumed property
-			(SalesOrderID) first and, if ByD rejects it, fall back to a direct ID
-			lookup (the STOD outbound-delivery ID has been observed to equal the
-			sales-order number for these transfers). A rejected filter is logged
-			with ByD's response so the real property name can be pinned down.
+			NOT YET WIRED INTO THE APPROVAL FLOW - pending confirmation that this
+			custom OData service accepts a POST. Every existing call to
+			khoutbounddelivery in this codebase is a read; only khinbounddelivery is
+			known to accept creates (see create_inbound_delivery_notification, which
+			this mirrors). Verify with a manual POST against the tenant before
+			calling this from sync_approved_receipt_to_sap.
 		'''
-		base = (f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/OutboundDeliveryCollection?$format=json"
-				f"&$expand=Item/ItemDeliveryQuantity,ProductRecipientParty/ProductRecipientDisplayName,"
-				f"ShipFromLocation,ShippingPeriod,ArrivalPeriod")
-		filter_url = f"{base}&$filter=SalesOrderID eq '{sales_order_id}'"
+		action_url = f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/OutboundDeliveryCollection"
 		try:
-			response = self.__get__(filter_url)
-			if response.status_code == 200:
-				results = json.loads(response.text)["d"]["results"]
-				return [self._enrich_delivery_items(d) for d in results]
-			logger.warning(
-				f"OutboundDelivery $filter by SalesOrderID rejected by ByD for sales order "
-				f"{sales_order_id}; falling back to ID lookup. Response: {response.text}"
-			)
+			self.refresh_csrf_token()
+			response = self.__post__(action_url, json=delivery_data)
+			if response.status_code == 201:
+				logger.info("Outbound Delivery successfully created in SAP ByD.")
+				return response.json()
+			else:
+				logger.error(f"Failed to create Outbound Delivery: {response.text}")
+				raise Exception(f"Error from SAP: {response.text}")
 		except Exception as e:
-			logger.warning(f"Error filtering OutboundDelivery by SalesOrderID for {sales_order_id}: {e}")
-
-		# Fallback: treat the sales-order number as the outbound-delivery ID.
-		delivery = self.get_delivery_by_id(sales_order_id)
-		return [delivery] if delivery else []
+			logger.error(f"Error creating Outbound Delivery: {str(e)}")
+			raise
 
 	def search_deliveries_by_store(self, store_id: str, status: str = None) -> list:
 		'''
