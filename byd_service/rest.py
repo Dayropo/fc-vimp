@@ -591,29 +591,66 @@ class RESTServices:
 				fingerprint[str(item_id)] = (item["ProductID"], round(quantity, 3))
 		return fingerprint
 
+	def query_delivery_requests_by_sales_order(self, sales_order_id: str) -> list:
+		"""
+			khoutbounddeliveryrequest/QueryByElements?SalesOrderID='...' - the service's
+			function import exposes the sales-order key that the entity itself lacks
+			($metadata, Sept 2026). Returns the matching requests with items expanded.
+		"""
+		action_url = (
+			f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddeliveryrequest/QueryByElements"
+			f"?SalesOrderID='{sales_order_id}'&$format=json"
+			f"&$expand=Item/ItemBuyerParty,Item/ItemScheduleLine/RequestedQuantity,Item/ItemScheduleLine/OpenQuantity"
+		)
+		response = self.__get__(action_url)
+		if response.status_code != 200:
+			logger.error(f"QueryByElements failed for sales order {sales_order_id}: {response.text}")
+			raise Exception(f"Error from SAP: {response.text}")
+		results = json.loads(response.text)["d"]["results"]
+		return results if isinstance(results, list) else [results]
+
 	def find_delivery_request_for_sales_order(self, sales_order: dict, window_hours: int = 3) -> dict:
 		"""
 			Locate the ByD Outbound Delivery Request created for a sales order.
 
-			Verified against khoutbounddeliveryrequest (tenant my350679, Sept 2026):
-			the request carries no sales order ID (BaseBusinessTransactionDocumentID is
-			the Logistics Execution Request number) and the sales order carries no
-			reference to it until a delivery exists. The only reliable join is content:
+			Primary: QueryByElements?SalesOrderID (see query_delivery_requests_by_sales_order),
+			verified against the item fingerprint below. Fallback, if that call fails:
+			scan requests created around the order's release and match on content -
 			the request's items repeat the sales order item number
 			(BaseBusinessTransactionDocumentItemID), ProductID and requested quantity.
-			Requests are created when the order is *released*, so the time window
-			spans the order's CreationDateTime..LastChangeDateTime plus a margin and
-			is only a pre-filter; several orders are routinely released within minutes.
+			Requests are created when the order is *released*, so the window spans
+			CreationDateTime..LastChangeDateTime plus a margin; several orders are
+			routinely released within minutes, hence content matching.
 
 			Returns the matching request (items expanded). Raises
 			DeliveryRequestNotFound / DeliveryRequestAmbiguous rather than guessing.
 		"""
-		from datetime import datetime, timedelta, timezone as dt_tz
-
 		so_id = sales_order.get("ID")
 		wanted = self._sales_order_fingerprint(sales_order)
 		if not wanted:
 			raise self.DeliveryRequestNotFound(f"Sales order {so_id} has no deliverable items to match on")
+
+		try:
+			by_key = self.query_delivery_requests_by_sales_order(so_id)
+		except Exception as e:
+			logger.warning(f"QueryByElements unavailable for sales order {so_id} ({e}); falling back to content match")
+			by_key = None
+		if by_key is not None:
+			if not by_key:
+				raise self.DeliveryRequestNotFound(f"No delivery request is linked to sales order {so_id}")
+			exact = [r for r in by_key if self._delivery_request_fingerprint(r) == wanted]
+			chosen = exact if exact else by_key
+			if len(chosen) > 1:
+				ids = ", ".join(str(r.get("BaseBusinessTransactionDocumentID")) for r in chosen)
+				raise self.DeliveryRequestAmbiguous(f"Delivery requests {ids} are all linked to sales order {so_id}")
+			if not exact:
+				logger.warning(
+					f"Delivery request {chosen[0].get('BaseBusinessTransactionDocumentID')} is linked to sales order "
+					f"{so_id} but its items differ from the order (order changed after release?)"
+				)
+			return chosen[0]
+
+		from datetime import datetime, timedelta, timezone as dt_tz
 
 		created = self._byd_epoch_ms(sales_order.get("CreationDateTime"))
 		changed = self._byd_epoch_ms(sales_order.get("LastChangeDateTime")) or created
