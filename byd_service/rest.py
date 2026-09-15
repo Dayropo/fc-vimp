@@ -594,20 +594,43 @@ class RESTServices:
 	def query_delivery_requests_by_sales_order(self, sales_order_id: str) -> list:
 		"""
 			khoutbounddeliveryrequest/QueryByElements?SalesOrderID='...' - the service's
-			function import exposes the sales-order key that the entity itself lacks
-			($metadata, Sept 2026). Returns the matching requests with items expanded.
+			function import exposes the sales-order key that the entity itself lacks.
+			Verified Sept 2026: SO 132 -> request 53; an order never released for
+			logistics returns []. Returns the matching requests with items expanded;
+			if $expand is not accepted on the function import, each request is
+			re-read through key access to get its items.
 		"""
-		action_url = (
+		expand = "Item/ItemBuyerParty,Item/ItemScheduleLine/RequestedQuantity,Item/ItemScheduleLine/OpenQuantity"
+		base_url = (
 			f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddeliveryrequest/QueryByElements"
-			f"?SalesOrderID='{sales_order_id}'&$format=json"
-			f"&$expand=Item/ItemBuyerParty,Item/ItemScheduleLine/RequestedQuantity,Item/ItemScheduleLine/OpenQuantity"
+			f"?SalesOrderID='{sales_order_id}'&NumberOfRows='50'&StartRow='0'&$format=json"
 		)
-		response = self.__get__(action_url)
+		response = self.__get__(f"{base_url}&$expand={expand}")
+		expanded = response.status_code == 200
+		if not expanded:
+			logger.info(f"QueryByElements with $expand rejected for sales order {sales_order_id}; retrying without")
+			response = self.__get__(base_url)
 		if response.status_code != 200:
 			logger.error(f"QueryByElements failed for sales order {sales_order_id}: {response.text}")
 			raise Exception(f"Error from SAP: {response.text}")
 		results = json.loads(response.text)["d"]["results"]
-		return results if isinstance(results, list) else [results]
+		results = results if isinstance(results, list) else [results]
+		if expanded:
+			return results
+
+		detailed = []
+		for request in results:
+			key_url = (
+				f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddeliveryrequest/"
+				f"OutboundDeliveryRequestCollection('{request['ObjectID']}')?$format=json&$expand={expand}"
+			)
+			key_response = self.__get__(key_url)
+			if key_response.status_code != 200:
+				logger.error(f"Failed to read delivery request {request['ObjectID']}: {key_response.text}")
+				raise Exception(f"Error from SAP: {key_response.text}")
+			full = json.loads(key_response.text)["d"]["results"]
+			detailed.append(full[0] if isinstance(full, list) else full)
+		return detailed
 
 	def find_delivery_request_for_sales_order(self, sales_order: dict, window_hours: int = 3) -> dict:
 		"""
