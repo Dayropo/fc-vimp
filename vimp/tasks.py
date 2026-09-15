@@ -826,6 +826,164 @@ def _transfer_retry(max_retries=3, delay=5):
 	return decorator
 
 
+def _line_item_unit_code(metadata: dict) -> str:
+	"""
+	SAP unit code for a receipt line. Outbound-delivery items carry it in
+	ItemDeliveryQuantity.UnitCode; sales-order items (eGRN 2 flow) carry it as
+	the lowercase ``unitCode`` on the Requested (TypeCode 1) schedule line.
+	unit_of_measurement on the model is the human text ("Each"), never the code.
+	"""
+	metadata = metadata or {}
+	delivery_quantity = metadata.get("ItemDeliveryQuantity")
+	if isinstance(delivery_quantity, dict) and delivery_quantity.get("UnitCode"):
+		return delivery_quantity["UnitCode"]
+	lines = metadata.get("ItemScheduleLine") or []
+	if isinstance(lines, dict):
+		lines = lines.get("results") or []
+	lines = [l for l in lines if isinstance(l, dict)]
+	for line in sorted(lines, key=lambda l: 0 if str(l.get("TypeCode")) == "1" else 1):
+		code = line.get("unitCode") or line.get("QuantityUnitCode") or line.get("UnitCode")
+		if code:
+			return code
+	return metadata.get("QuantityUnitCode", "")
+
+
+class GoodsIssueHeld(Exception):
+	"""
+	The goods issue was deliberately not posted (feature disabled, short receipt
+	under the 'hold' policy, or an ambiguous ByD match). Not retryable; the
+	receipt stays unsynced for a person to resolve.
+	"""
+
+
+def create_outbound_delivery_for_receipt(receipt):
+	"""
+	eGRN 2 step 3: on SCD approval of a sales-order receipt, create and post the
+	Outbound Delivery in ByD, then back-fill the delivery on the InboundDelivery.
+
+	ByD mechanism (verified Sept 2026, see RESTServices docstrings):
+	  sales order --release--> delivery request --ItemPostGoodsIssue--> outbound
+	  delivery (created + goods issue posted). The request has no sales-order
+	  key, so it is located by item fingerprint; the delivery is then read back
+	  from the sales order's DocumentReference (TypeCode 73).
+
+	Idempotent: if the sales order already has a delivery, nothing is posted and
+	the delivery is just back-filled. Every write is gated by
+	settings.BYD_AUTO_POST_GOODS_ISSUE (default off) because it moves stock.
+
+	Quantity: ItemPostGoodsIssue ships the item's full open quantity. When the
+	received quantity is lower, settings.BYD_SHORT_RECEIPT_POLICY decides:
+	  'hold'      (default) raise GoodsIssueHeld and leave the receipt for review
+	  'post_full' post the open quantity and record the shortfall in metadata
+	"""
+	from django.conf import settings
+
+	inbound_delivery = receipt.inbound_delivery
+	so_id = inbound_delivery.sales_order_reference
+	rest_client = byd_rest.RESTServices()
+
+	def _backfill(delivery_ref):
+		delivery = rest_client.get_outbound_delivery_by_object_id(delivery_ref["ObjectID"]) or {}
+		inbound_delivery.object_id = delivery_ref["ObjectID"]
+		inbound_delivery.delivery_id = delivery.get("ID") or delivery_ref.get("ID")
+		if delivery:
+			inbound_delivery.delivery_type_code = delivery.get("DeliveryTypeCode", inbound_delivery.delivery_type_code)
+			inbound_delivery.metadata = {**(inbound_delivery.metadata or {}), "outbound_delivery": delivery}
+		inbound_delivery.save(update_fields=['object_id', 'delivery_id', 'delivery_type_code', 'metadata'])
+		receipt.metadata['byd_outbound_delivery'] = {
+			"object_id": inbound_delivery.object_id,
+			"delivery_id": inbound_delivery.delivery_id,
+			"linked_at": timezone.now().isoformat(),
+		}
+		receipt.save(update_fields=['metadata'])
+		logger.info(f"TR-{receipt.receipt_number}: linked outbound delivery {inbound_delivery.delivery_id} for SO {so_id}")
+
+	# Already delivered in ByD (previous run, or someone posted it in the UI)?
+	existing = rest_client.get_sales_order_outbound_deliveries(so_id)
+	if existing:
+		if len(existing) > 1:
+			logger.warning(f"SO {so_id} has {len(existing)} outbound deliveries; linking the latest")
+		_backfill(existing[-1])
+		return
+
+	if not getattr(settings, 'BYD_AUTO_POST_GOODS_ISSUE', False):
+		raise GoodsIssueHeld(
+			f"BYD_AUTO_POST_GOODS_ISSUE is off: outbound delivery for SO {so_id} must be posted in ByD manually"
+		)
+
+	sales_order = rest_client.get_sales_order_by_id(so_id)
+	if not sales_order:
+		raise SAPIntegrationError(f"Sales order {so_id} not found in ByD")
+
+	try:
+		request = rest_client.find_delivery_request_for_sales_order(sales_order)
+	except (rest_client.DeliveryRequestNotFound, rest_client.DeliveryRequestAmbiguous) as e:
+		raise GoodsIssueHeld(str(e))
+
+	request_items = request.get("Item") or []
+	if isinstance(request_items, dict):
+		request_items = request_items.get("results") or []
+	by_so_item = {str(i.get("BaseBusinessTransactionDocumentItemID")): i for i in request_items}
+
+	policy = getattr(settings, 'BYD_SHORT_RECEIPT_POLICY', 'hold')
+	plan, shortfalls = [], []
+	for line in receipt.line_items.select_related('inbound_delivery_line_item'):
+		received = float(line.quantity_received)
+		if received <= 0:
+			continue
+		so_item_id = str((line.inbound_delivery_line_item.metadata or {}).get("ID", ""))
+		request_item = by_so_item.get(so_item_id)
+		if not request_item:
+			raise GoodsIssueHeld(
+				f"SO {so_id} item {so_item_id} ({line.inbound_delivery_line_item.product_id}) has no delivery request item"
+			)
+		open_quantity = 0.0
+		for sched in (request_item.get("ItemScheduleLine") or []):
+			open_node = sched.get("OpenQuantity") or {}
+			if isinstance(open_node, dict) and open_node.get("Quantity") is not None:
+				open_quantity = float(open_node["Quantity"])
+				break
+		if open_quantity <= 0:
+			logger.info(f"SO {so_id} item {so_item_id} already delivered in ByD (open qty 0); skipping")
+			continue
+		if received < open_quantity:
+			shortfalls.append({
+				"so_item": so_item_id,
+				"product_id": line.inbound_delivery_line_item.product_id,
+				"open_quantity": open_quantity,
+				"received": received,
+			})
+		plan.append(request_item["ObjectID"])
+
+	if shortfalls:
+		receipt.metadata['byd_short_receipt'] = shortfalls
+		receipt.save(update_fields=['metadata'])
+		if policy != 'post_full':
+			raise GoodsIssueHeld(
+				f"Received less than ordered on {len(shortfalls)} item(s) of SO {so_id}; "
+				f"ItemPostGoodsIssue would ship the full open quantity (BYD_SHORT_RECEIPT_POLICY={policy})"
+			)
+
+	if not plan:
+		raise GoodsIssueHeld(f"Nothing to post for SO {so_id}: no received line maps to an open request item")
+
+	posted = []
+	for item_object_id in plan:
+		rest_client.post_goods_issue_for_request_item(item_object_id, auto_release=True)
+		posted.append(item_object_id)
+		receipt.metadata['byd_goods_issue_items'] = posted
+		receipt.save(update_fields=['metadata'])
+
+	# ByD needs a moment before the new delivery shows on the sales order.
+	for attempt in range(6):
+		time.sleep(5)
+		created = rest_client.get_sales_order_outbound_deliveries(so_id)
+		if created:
+			_backfill(created[-1])
+			return
+	raise RetryableError(f"Goods issue posted for SO {so_id} but no outbound delivery is visible yet")
+
+
 def post_goods_receipt_on_byd(receipt):
 	"""
 	Post a Goods Receipt on ByD for a completed transfer receipt.
@@ -846,11 +1004,7 @@ def post_goods_receipt_on_byd(receipt):
 	# (unit_of_measurement stores human-readable text like "Each", not the code "EA")
 	items = []
 	for index, line_item in enumerate(receipt.line_items.all()):
-		metadata = line_item.inbound_delivery_line_item.metadata
-		unit_code = (
-			metadata.get("ItemDeliveryQuantity", {}).get("UnitCode", "")
-			or metadata.get("QuantityUnitCode", "")
-		)
+		unit_code = _line_item_unit_code(line_item.inbound_delivery_line_item.metadata)
 		items.append({
 			"ID": str(index + 1),
 			"TypeCode": "14",
@@ -922,19 +1076,17 @@ def sync_approved_receipt_to_sap(receipt_id: int):
 	Sync an approved transfer receipt to SAP ByD.
 	Only called after SCD Team approves the receipt.
 
-	Delegates to post_goods_receipt_on_byd() which handles the two-step
-	ByD flow: create Inbound Delivery Notification → PostGoodsReceipt.
-	Updates synced_to_sap on success.
+	Legacy flow (receipt against an existing outbound delivery):
+	  post_goods_receipt_on_byd(): Inbound Delivery Notification -> PostGoodsReceipt.
 
-	TODO (eGRN 2 cutover, step 3): under the sales-order-anchored flow the store
-	receives against a Sales Order and NO outbound delivery exists yet. This task
-	must additionally create the Outbound Delivery in ByD for the confirmed
-	received quantity, then back-fill receipt.inbound_delivery.object_id /
-	.delivery_id from the response. RESTServices.create_outbound_delivery() is
-	written for this but deliberately not wired in yet - it is unverified whether
-	khoutbounddelivery/OutboundDeliveryCollection accepts a POST in this tenant.
-	Also open: whether the existing inbound notification + PostGoodsReceipt below
-	is still required once the outbound delivery is created, or is superseded by it.
+	eGRN 2 flow (receipt against a sales order, no delivery yet):
+	  1. create_outbound_delivery_for_receipt(): locate the delivery request,
+	     post goods issue per received item, back-fill object_id / delivery_id
+	     (gated by settings.BYD_AUTO_POST_GOODS_ISSUE; raises GoodsIssueHeld
+	     when it must not proceed - the receipt then stays unsynced for review)
+	  2. post_goods_receipt_on_byd() as before, so the receiving site books the
+	     goods receipt against the stock now in transit.
+	Updates synced_to_sap on success.
 	"""
 	from transfer_service.models import TransferReceiptNote
 
@@ -960,6 +1112,19 @@ def sync_approved_receipt_to_sap(receipt_id: int):
 		if receipt.synced_to_sap:
 			logger.info(f"Receipt TR-{receipt.receipt_number} already synced to SAP")
 			return
+
+		inbound_delivery = receipt.inbound_delivery
+		if inbound_delivery.sales_order_reference and not inbound_delivery.object_id:
+			try:
+				create_outbound_delivery_for_receipt(receipt)
+			except GoodsIssueHeld as held:
+				receipt.metadata['byd_goods_issue_held'] = {
+					'reason': str(held),
+					'at': timezone.now().isoformat(),
+				}
+				receipt.save(update_fields=['metadata'])
+				logger.warning(f"TR-{receipt.receipt_number}: goods issue held - {held}")
+				return
 
 		# Delegate to the two-step ByD posting function (raises on failure)
 		post_goods_receipt_on_byd(receipt)

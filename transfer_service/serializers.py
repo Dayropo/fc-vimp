@@ -206,6 +206,19 @@ class TransferReceiptNoteSerializer(serializers.ModelSerializer):
         except InboundDelivery.DoesNotExist:
             raise serializers.ValidationError({"delivery": ["Inbound delivery not found"]})
 
+        # eGRN 2: a sales order is received once. SCD approval posts the outbound
+        # delivery for what was received; a second receipt could not be posted.
+        if inbound_delivery.sales_order_reference:
+            open_receipt = inbound_delivery.receipts.exclude(approval_status='rejected').first()
+            if open_receipt:
+                raise serializers.ValidationError({
+                    "delivery": [
+                        f"Sales order {inbound_delivery.sales_order_reference} already has receipt "
+                        f"TR-{open_receipt.receipt_number} ({open_receipt.approval_status}); "
+                        f"only one receipt is allowed per sales order"
+                    ]
+                })
+
         inbound_delivery_line_items = inbound_delivery.line_items.all()
         received_line_items = self.initial_data.get('line_items', [])
         

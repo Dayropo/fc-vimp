@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import logging
 import time
 from requests import get, post, auth as requests_auth
@@ -331,7 +332,9 @@ class RESTServices:
 			Fetch a sales order from SAP ByD by ID
 		'''
 		action_url = (f"{self.endpoint}/sap/byd/odata/cust/v1/khsalesorder/SalesOrderCollection?$format=json"
-					  f"&$expand=BuyerParty/BuyerPartyName,SalesUnitParty/SalesUnitPartyName,PricingTerms,Item/ItemProduct,Item/ItemScheduleLine,Item&$filter=ID eq '{sales_order_id}'")
+					  f"&$expand=BuyerParty/BuyerPartyName,SalesUnitParty/SalesUnitPartyName,ProductRecipientParty,"
+					  f"RequestedFulfillmentPeriod,PricingTerms,Item/ItemProduct,Item/ItemScheduleLine,"
+					  f"Item/ItemShipFromLocation,Item/ItemProductRecipientParty,Item&$filter=ID eq '{sales_order_id}'")
 		
 		try:
 			response = self.__get__(action_url)
@@ -346,6 +349,48 @@ class RESTServices:
 			logger.error(f"Error fetching sales order {sales_order_id}: {str(e)}")
 			raise
 	
+	def get_sales_order_outbound_deliveries(self, sales_order_id: str) -> list:
+		'''
+			List the outbound deliveries ByD has created for a sales order.
+
+			Verified against khsalesorder (tenant my350679, Sept 2026): the sales
+			order's DocumentReference node lists successor documents; outbound
+			deliveries carry TypeCode "73". Only deliveries appear there - the
+			intermediate delivery request (TypeCode 68) is never referenced.
+			ByD ObjectIDs are the UUID with the dashes removed, so the delivery
+			ObjectID (needed by khoutbounddelivery/Release) is derived here.
+
+			Returns [{"ID": "11", "UUID": "...", "ObjectID": "..."}], empty when
+			no delivery exists yet.
+		'''
+		action_url = (f"{self.endpoint}/sap/byd/odata/cust/v1/khsalesorder/SalesOrderCollection?$format=json"
+					  f"&$expand=DocumentReference&$filter=ID eq '{sales_order_id}'")
+		try:
+			response = self.__get__(action_url)
+			if response.status_code != 200:
+				logger.error(f"Failed to fetch document references for sales order {sales_order_id}: {response.text}")
+				return []
+			results = json.loads(response.text)["d"]["results"]
+			if not results:
+				return []
+			references = results[0].get("DocumentReference") or []
+			if isinstance(references, dict):
+				# {"results": [...]} or a {"__deferred": ...} stub when empty
+				references = references.get("results") or []
+			deliveries = []
+			for ref in references:
+				if str(ref.get("TypeCode")) != "73" or not ref.get("UUID"):
+					continue
+				deliveries.append({
+					"ID": ref.get("ID"),
+					"UUID": ref["UUID"],
+					"ObjectID": ref["UUID"].replace("-", "").upper(),
+				})
+			return deliveries
+		except Exception as e:
+			logger.error(f"Error fetching document references for sales order {sales_order_id}: {str(e)}")
+			raise
+
 	def get_store_sales_orders(self, store_id: str) -> list:
 		'''
 			Get sales orders for a specific store (as source or destination)
@@ -473,30 +518,194 @@ class RESTServices:
 			logger.error(f"Error fetching delivery {delivery_id}: {str(e)}")
 			raise
 
-	def create_outbound_delivery(self, delivery_data: dict) -> dict:
-		'''
-			Create an Outbound Delivery in SAP ByD for the confirmed received quantity.
+	class DeliveryRequestNotFound(Exception):
+		"""No delivery request in ByD matches the sales order."""
 
-			NOT YET WIRED INTO THE APPROVAL FLOW - pending confirmation that this
-			custom OData service accepts a POST. Every existing call to
-			khoutbounddelivery in this codebase is a read; only khinbounddelivery is
-			known to accept creates (see create_inbound_delivery_notification, which
-			this mirrors). Verify with a manual POST against the tenant before
-			calling this from sync_approved_receipt_to_sap.
-		'''
-		action_url = f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/OutboundDeliveryCollection"
+	class DeliveryRequestAmbiguous(Exception):
+		"""More than one delivery request matches the sales order."""
+
+	@staticmethod
+	def _byd_epoch_ms(value):
+		"""'/Date(1747737892692)/' -> 1747737892692; ISO strings -> epoch ms; else None."""
+		if not value:
+			return None
+		text = str(value)
+		match = re.search(r"/Date\((-?\d+)", text)
+		if match:
+			return int(match.group(1))
 		try:
-			self.refresh_csrf_token()
-			response = self.__post__(action_url, json=delivery_data)
-			if response.status_code == 201:
-				logger.info("Outbound Delivery successfully created in SAP ByD.")
-				return response.json()
-			else:
-				logger.error(f"Failed to create Outbound Delivery: {response.text}")
-				raise Exception(f"Error from SAP: {response.text}")
-		except Exception as e:
-			logger.error(f"Error creating Outbound Delivery: {str(e)}")
-			raise
+			from datetime import datetime, timezone as dt_tz
+			parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+			if parsed.tzinfo is None:
+				parsed = parsed.replace(tzinfo=dt_tz.utc)
+			return int(parsed.timestamp() * 1000)
+		except ValueError:
+			return None
+
+	@staticmethod
+	def _sales_order_fingerprint(sales_order: dict) -> dict:
+		"""
+			{item ID: (ProductID, requested quantity)} for the non-cancelled items of a
+			khsalesorder payload. The delivery request repeats the sales order item
+			number as BaseBusinessTransactionDocumentItemID, so this is the join key.
+		"""
+		fingerprint = {}
+		items = sales_order.get("Item") or []
+		if isinstance(items, dict):
+			items = items.get("results") or []
+		for item in items:
+			if str(item.get("CancellationStatusCode", "")) == "4":
+				continue
+			product = item.get("ItemProduct") or {}
+			product_id = product.get("ProductID") if isinstance(product, dict) else None
+			lines = item.get("ItemScheduleLine") or []
+			if isinstance(lines, dict):
+				lines = lines.get("results") or []
+			requested = next((l for l in lines if str(l.get("TypeCode")) == "1"), lines[0] if lines else {})
+			quantity = requested.get("Quantity")
+			if item.get("ID") and product_id and quantity is not None:
+				fingerprint[str(item["ID"])] = (product_id, round(float(quantity), 3))
+		return fingerprint
+
+	@staticmethod
+	def _delivery_request_fingerprint(request: dict) -> dict:
+		"""Same shape as _sales_order_fingerprint, built from a khoutbounddeliveryrequest payload."""
+		fingerprint = {}
+		items = request.get("Item") or []
+		if isinstance(items, dict):
+			items = items.get("results") or []
+		for item in items:
+			if str(item.get("CancellationStatusCode", "")) == "4":
+				continue
+			lines = item.get("ItemScheduleLine") or []
+			if isinstance(lines, dict):
+				lines = lines.get("results") or []
+			quantity = None
+			for line in lines:
+				requested = line.get("RequestedQuantity") or {}
+				if isinstance(requested, dict) and requested.get("Quantity") is not None:
+					quantity = float(requested["Quantity"])
+					break
+			item_id = item.get("BaseBusinessTransactionDocumentItemID")
+			if item_id and item.get("ProductID") and quantity is not None:
+				fingerprint[str(item_id)] = (item["ProductID"], round(quantity, 3))
+		return fingerprint
+
+	def find_delivery_request_for_sales_order(self, sales_order: dict, window_hours: int = 3) -> dict:
+		"""
+			Locate the ByD Outbound Delivery Request created for a sales order.
+
+			Verified against khoutbounddeliveryrequest (tenant my350679, Sept 2026):
+			the request carries no sales order ID (BaseBusinessTransactionDocumentID is
+			the Logistics Execution Request number) and the sales order carries no
+			reference to it until a delivery exists. The only reliable join is content:
+			the request's items repeat the sales order item number
+			(BaseBusinessTransactionDocumentItemID), ProductID and requested quantity.
+			Requests are created when the order is *released*, so the time window
+			spans the order's CreationDateTime..LastChangeDateTime plus a margin and
+			is only a pre-filter; several orders are routinely released within minutes.
+
+			Returns the matching request (items expanded). Raises
+			DeliveryRequestNotFound / DeliveryRequestAmbiguous rather than guessing.
+		"""
+		from datetime import datetime, timedelta, timezone as dt_tz
+
+		so_id = sales_order.get("ID")
+		wanted = self._sales_order_fingerprint(sales_order)
+		if not wanted:
+			raise self.DeliveryRequestNotFound(f"Sales order {so_id} has no deliverable items to match on")
+
+		created = self._byd_epoch_ms(sales_order.get("CreationDateTime"))
+		changed = self._byd_epoch_ms(sales_order.get("LastChangeDateTime")) or created
+		if created is None:
+			raise self.DeliveryRequestNotFound(f"Sales order {so_id} has no CreationDateTime")
+		margin = timedelta(hours=window_hours)
+		low = datetime.fromtimestamp(created / 1000, dt_tz.utc) - margin
+		high = datetime.fromtimestamp(max(created, changed) / 1000, dt_tz.utc) + margin
+		fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+		# CreationDateTime is Edm.DateTimeOffset on this entity: the literal must be
+		# datetimeoffset'...' (datetime'...' is rejected with "Invalid parametertype").
+		action_url = (
+			f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddeliveryrequest/OutboundDeliveryRequestCollection"
+			f"?$format=json&$top=200"
+			f"&$filter=CreationDateTime ge datetimeoffset'{low.strftime(fmt)}' and "
+			f"CreationDateTime le datetimeoffset'{high.strftime(fmt)}'"
+			f"&$expand=Item/ItemBuyerParty,Item/ItemScheduleLine/RequestedQuantity,Item/ItemScheduleLine/OpenQuantity"
+		)
+		response = self.__get__(action_url)
+		if response.status_code != 200:
+			logger.error(f"Failed to list delivery requests for sales order {so_id}: {response.text}")
+			raise Exception(f"Error from SAP: {response.text}")
+		candidates = json.loads(response.text)["d"]["results"]
+
+		matches = [c for c in candidates if self._delivery_request_fingerprint(c) == wanted]
+		if not matches:
+			raise self.DeliveryRequestNotFound(
+				f"No delivery request among {len(candidates)} candidates matches sales order {so_id}"
+			)
+		if len(matches) > 1:
+			ids = ", ".join(str(m.get("BaseBusinessTransactionDocumentID")) for m in matches)
+			raise self.DeliveryRequestAmbiguous(
+				f"Delivery requests {ids} all match sales order {so_id}; refusing to post"
+			)
+		logger.info(
+			f"Sales order {so_id} matched delivery request "
+			f"{matches[0].get('BaseBusinessTransactionDocumentID')} ({matches[0].get('ObjectID')})"
+		)
+		return matches[0]
+
+	def post_goods_issue_for_request_item(self, item_object_id: str, auto_release: bool = True) -> dict:
+		"""
+			Create the outbound delivery for one delivery-request item and post its
+			goods issue: POST khoutbounddeliveryrequest/ItemPostGoodsIssue (from the
+			Postman collection "Post goods issue"). With AutoReleaseOutboundDelivery
+			the delivery is released in the same call; without it the delivery is left
+			"Not Released" for release_outbound_delivery().
+
+			The action takes no quantity: ByD ships the item's full open quantity.
+			THIS MOVES STOCK. Callers gate it behind settings.BYD_AUTO_POST_GOODS_ISSUE.
+		"""
+		flag = "true" if auto_release else "false"
+		action_url = (
+			f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddeliveryrequest/ItemPostGoodsIssue"
+			f"?ObjectID='{item_object_id}'&AutoReleaseOutboundDelivery={flag}"
+		)
+		self.refresh_csrf_token()
+		response = self.__post__(action_url)
+		if response.status_code in (200, 201, 204):
+			logger.info(f"Goods issue posted for delivery request item {item_object_id}")
+			return response.json() if response.text else {}
+		logger.error(f"Failed to post goods issue for request item {item_object_id}: {response.text}")
+		raise Exception(f"Error from SAP: {response.text}")
+
+	def release_outbound_delivery(self, delivery_object_id: str) -> dict:
+		"""
+			Release an existing "Not Released" outbound delivery:
+			POST khoutbounddelivery/Release?ObjectID='...' (Postman "Release outbound delivery").
+			THIS MOVES STOCK. Callers gate it behind settings.BYD_AUTO_POST_GOODS_ISSUE.
+		"""
+		if self.check_object_lock(delivery_object_id, 'delivery'):
+			logger.warning(f"Outbound delivery {delivery_object_id} is locked. Will retry later.")
+			raise Exception("Object is locked")
+		action_url = f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/Release?ObjectID='{delivery_object_id}'"
+		self.refresh_csrf_token()
+		response = self.__post__(action_url)
+		if response.status_code in (200, 201, 204):
+			logger.info(f"Outbound delivery {delivery_object_id} released")
+			return response.json() if response.text else {}
+		logger.error(f"Failed to release outbound delivery {delivery_object_id}: {response.text}")
+		raise Exception(f"Error from SAP: {response.text}")
+
+	def get_outbound_delivery_by_object_id(self, object_id: str) -> dict:
+		"""Key access on khoutbounddelivery; d.results is a single object here, not a list."""
+		action_url = f"{self.endpoint}/sap/byd/odata/cust/v1/khoutbounddelivery/OutboundDeliveryCollection('{object_id}')?$format=json"
+		response = self.__get__(action_url)
+		if response.status_code != 200:
+			logger.error(f"Failed to fetch outbound delivery {object_id}: {response.text}")
+			return None
+		result = json.loads(response.text)["d"]["results"]
+		return result[0] if isinstance(result, list) else result
 
 	def search_deliveries_by_store(self, store_id: str, status: str = None) -> list:
 		'''
