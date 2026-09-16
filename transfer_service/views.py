@@ -244,45 +244,59 @@ def get_inbound_deliveries(request):
 @authentication_classes([CombinedAuthentication])
 def get_inbound_delivery(request, pk):
 	"""
-	Get details of a specific inbound delivery
-	If not found locally, try to fetch from SAP ByD
+	Get the expected receipt for a Sales Order so the store can record what it
+	actually received.
+
+	`pk` is the SAP ByD Sales Order ID. This mirrors egrn_service.get_purchase_order's
+	single-identifier, local-then-ByD pattern - `pk` here plays the role `po_id`
+	plays there. No Outbound Delivery is read or required: under the post-cutover
+	flow the outbound delivery is only created in ByD once SCD approves the receipt.
 
 	Query Parameters:
-	- refresh: If 'true', force refresh from SAP ByD and update existing record
+	- refresh: If 'true', discard the cached copy and re-read from SAP ByD
 	"""
 	try:
 		# Check if refresh is requested
 		refresh = request.query_params.get('refresh', '').lower() == 'true'
 
-		delivery = None
+		delivery = (
+			InboundDelivery.objects
+			.filter(sales_order_reference=pk)
+			.order_by('-delivery_date', '-id')
+			.first()
+		)
 
-		if not refresh:
-			try:
-				# Check if delivery exists locally
-				delivery = InboundDelivery.objects.get(delivery_id=pk)
-			except InboundDelivery.DoesNotExist:
-				pass
-		# If refresh requested or delivery not found, fetch from SAP ByD
+		if refresh and delivery is not None and delivery.receipts.exists():
+			# Re-reading deletes and recreates the row, and TransferReceiptNote
+			# cascades off it - refuse rather than destroy receipt history.
+			return APIResponse(
+				status=status.HTTP_409_CONFLICT,
+				message=(
+					f"Sales order {pk} already has receipts recorded against it and "
+					f"cannot be refreshed from SAP ByD."
+				)
+			)
+
+		# If refresh requested or nothing cached, read the sales order from SAP ByD
 		if refresh or delivery is None:
 			byd_rest = RESTServices()
-			delivery_data = byd_rest.get_delivery_by_id(pk)
-			if not delivery_data:
+
+			sales_order_data = byd_rest.get_sales_order_by_id(pk)
+			if not sales_order_data:
 				return APIResponse(
 					status=status.HTTP_404_NOT_FOUND,
-					message=f"Delivery {pk} not found in SAP ByD"
+					message=f"Sales order {pk} not found in SAP ByD"
 				)
 
-			# Delete any existing delivery with the same object_id to avoid duplicate key error
-			object_id = delivery_data.get("ObjectID")
-			if object_id:
-				InboundDelivery.objects.filter(object_id=object_id).delete()
-			elif delivery:
-				# Fallback: delete the delivery found by delivery_id
+			# Attach product details and pricing to each item for the receiving screen
+			sales_order_data = byd_rest._enrich_delivery_items(sales_order_data)
+
+			# Drop the stale cached copy before recreating it
+			if delivery:
 				delivery.line_items.all().delete()
 				delivery.delete()
 
-			# Create delivery record with fresh data
-			delivery = InboundDelivery.create_from_byd_data(delivery_data)
+			delivery = InboundDelivery.create_from_sales_order_data(sales_order_data)
 
 		# Authorized if user can access via destination store OR source warehouse
 		if not AuthorizationService.user_can_access_delivery(request.user, delivery):
@@ -290,17 +304,20 @@ def get_inbound_delivery(request, pk):
 				status=status.HTTP_403_FORBIDDEN,
 				message="You are not authorized to access this delivery"
 			)
-		# Return the delivery data
+		# Return the expected-receipt data
 		return APIResponse(
 			status=status.HTTP_200_OK,
-			message="Delivery fetched successfully" if not refresh else "Delivery refreshed successfully",
+			message=(
+				f"Sales order {pk} fetched successfully" if not refresh
+				else f"Sales order {pk} refreshed successfully"
+			),
 			data=InboundDeliverySerializer(delivery).data
 		)
 	except Exception as e:
-		logger.error(f"Error fetching delivery {pk}: {e}")
+		logger.error(f"Error fetching sales order {pk}: {e}")
 		return APIResponse(
 			status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			message=f"Error fetching delivery {pk}: {e}"
+			message=f"Error fetching sales order {pk}: {e}"
 		)
 
 

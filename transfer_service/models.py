@@ -8,6 +8,7 @@ from django.utils import timezone
 from core_service.models import CustomUser
 from egrn_service.models import Store
 from byd_service.util import to_python_time
+from datetime import datetime
 from byd_service.rest import RESTServices
 from egrn_service.services import Middleware
 from django.core.exceptions import ObjectDoesNotExist
@@ -52,9 +53,72 @@ class MaterialPricing(models.Model):
 	def __str__(self):
 		return f"{self.material_id} - {self.currency} {self.unit_price} (effective {self.effective_date})"
 
+def _byd_node(value):
+	"""
+	Return a ByD OData navigation node as a dict. An expanded association with
+	no instance is returned by ByD as {"__deferred": {...}}, which must read as
+	empty rather than as a record.
+	"""
+	if not isinstance(value, dict) or "__deferred" in value:
+		return {}
+	return value
+
+
+def _byd_results(value):
+	"""
+	Normalise a ByD collection navigation to a list: ByD returns either a bare
+	list, {"results": [...]}, or a deferred stub when nothing was expanded.
+	"""
+	if isinstance(value, list):
+		return [v for v in value if isinstance(v, dict)]
+	if isinstance(value, dict) and "results" in value:
+		return [v for v in (value.get("results") or []) if isinstance(v, dict)]
+	return []
+
+
+def _byd_datetime(value):
+	"""
+	Parse a ByD timestamp. Most nodes use "/Date(1611135136576)/" but
+	RequestedFulfillmentPeriod on khsalesorder returns ISO 8601
+	("2021-01-21T23:00:00Z"), which to_python_time would silently misread as
+	epoch-second 2021. Returns None when the value is unparseable.
+	"""
+	if not value:
+		return None
+	text = str(value).strip()
+	if "T" in text:
+		try:
+			return datetime.fromisoformat(text.replace("Z", "+00:00"))
+		except ValueError:
+			return None
+	try:
+		return to_python_time(text)
+	except (AttributeError, ValueError, OverflowError):
+		return None
+
+
+def _pick_schedule_line(schedule_lines):
+	"""
+	A sales-order item carries several schedule lines (TypeCode 1 = Requested,
+	2 = Confirmed). The store receives against what was ordered, so prefer the
+	Requested line; fall back to whatever is first.
+	"""
+	for wanted in ("1", "2"):
+		for line in schedule_lines:
+			if str(line.get("TypeCode", "")) == wanted:
+				return line
+	return schedule_lines[0] if schedule_lines else {}
+
+
 class InboundDelivery(models.Model):
 	"""
-	Represents an inbound delivery notification from SAP ByD for warehouse-to-store transfers
+	An expected warehouse-to-store receipt, anchored on the SAP ByD Sales Order.
+
+	The store receives against the Sales Order, which only signals intent to ship
+	and does not itself deplete inventory. The Outbound Delivery is NOT created up
+	front - it is created in ByD only once SCD approves the receipt, for the
+	confirmed actual quantity. `object_id` / `delivery_id` are therefore empty
+	until that approval happens, and are back-filled at that point.
 	"""
 	DELIVERY_STATUS_CHOICES = [
 		('1', 'Open'),
@@ -62,16 +126,32 @@ class InboundDelivery(models.Model):
 		('3', 'Completed'),
 		('4', 'Cancelled')
 	]
-	
-	object_id = models.CharField(max_length=32, unique=True)
-	delivery_id = models.CharField(max_length=50, unique=True)
+
+	# Anchor: the Sales Order the store receives against.
+	# Deliberately not unique=True - legacy rows created from outbound deliveries
+	# before the cutover may repeat or omit it. One-row-per-sales-order is enforced
+	# in the lookup path instead.
+	sales_order_reference = models.CharField(
+		max_length=50, null=True, blank=True, db_index=True,
+		help_text="SAP ByD Sales Order ID - what the store receives against"
+	)
+	sales_order_object_id = models.CharField(
+		max_length=32, null=True, blank=True,
+		help_text="SAP ByD ObjectID of the Sales Order"
+	)
+
+	# Outbound delivery identifiers: unknown until SCD approval creates the
+	# outbound delivery in ByD, then back-filled. Nullable + unique is safe -
+	# MySQL allows multiple NULLs in a unique index.
+	object_id = models.CharField(max_length=32, unique=True, null=True, blank=True)
+	delivery_id = models.CharField(max_length=50, unique=True, null=True, blank=True)
+	delivery_type_code = models.CharField(max_length=10, blank=True, help_text="SAP ByD delivery type code")
+
 	source_location_id = models.CharField(max_length=50, help_text="Warehouse/Location ID from SAP ByD")
 	source_location_name = models.CharField(max_length=100, blank=True, help_text="Warehouse/Location name")
 	destination_store = models.ForeignKey(Store, on_delete=models.CASCADE, related_name='inbound_deliveries')
 	delivery_date = models.DateField()
 	delivery_status_code = models.CharField(max_length=1, choices=DELIVERY_STATUS_CHOICES, default='1')
-	delivery_type_code = models.CharField(max_length=10, blank=True, help_text="SAP ByD delivery type code")
-	sales_order_reference = models.CharField(max_length=50, null=True, blank=True)
 	metadata = models.JSONField(default=dict)
 	created_date = models.DateTimeField(auto_now_add=True)
 	
@@ -185,6 +265,123 @@ class InboundDelivery(models.Model):
 			logger.error(f"Error creating delivery {delivery.delivery_id}: {e}")
 			raise ValidationError(f"Error creating delivery: {e}")
 	
+	@classmethod
+	def create_from_sales_order_data(cls, sales_order_data):
+		"""
+		Create an expected receipt from a SAP ByD Sales Order (the post-cutover flow).
+
+		No Outbound Delivery exists at this point, so object_id / delivery_id are
+		left empty; they are back-filled when SCD approval creates the outbound
+		delivery in ByD.
+
+		Field mappings verified against khsalesorder/SalesOrderCollection payloads
+		(ByD tenant my350679, Sept 2026):
+		  - destination store: ProductRecipientParty.PartyID (header/item). On
+		    current intracompany transfers BuyerParty is the company (FC-0001);
+		    on older orders it is the store account (1468), so it is the fallback.
+		  - source warehouse: Item/ItemShipFromLocation.LocationID (e.g. 13101).
+		    SalesUnitParty is NOT reliable - it is often the company itself (1000).
+		  - quantities: Item/ItemScheduleLine is a list of {TypeCode 1=Requested,
+		    2=Confirmed}; unit lives in the lowercase key ``unitCode``.
+		  - items with CancellationStatusCode "4" (Canceled) are skipped.
+		Expanded navigations that are empty come back as ``{"__deferred": ...}``,
+		which every lookup below treats as absent.
+		"""
+		for field in ("ObjectID", "ID"):
+			if field not in sales_order_data:
+				raise ValidationError(f"Required field '{field}' missing from sales order data")
+
+		delivery = cls()
+		delivery.sales_order_reference = sales_order_data["ID"]
+		delivery.sales_order_object_id = sales_order_data["ObjectID"]
+		# object_id / delivery_id intentionally left NULL until SCD approval.
+		delivery.delivery_status_code = "1"
+		delivery.delivery_type_code = ""
+
+		# Delivery date: requested fulfilment window, else creation date, else today.
+		requested_period = _byd_node(sales_order_data.get("RequestedFulfillmentPeriod"))
+		raw_date = (
+			requested_period.get("StartDateTime")
+			or requested_period.get("EndDateTime")
+			or sales_order_data.get("RequestedFulfillmentDate")
+			or sales_order_data.get("CreationDateTime")
+		)
+		parsed = _byd_datetime(raw_date) if raw_date else None
+		delivery.delivery_date = parsed.date() if parsed else timezone.now().date()
+
+		items = _byd_results(sales_order_data.get("Item"))
+
+		# Source warehouse - the ship-from site on the items; SalesUnitParty is
+		# frequently the company (1000) rather than a warehouse, so it is only a
+		# fallback.
+		delivery.source_location_id = ""
+		for item in items:
+			ship_from = _byd_node(item.get("ItemShipFromLocation"))
+			if ship_from.get("LocationID"):
+				delivery.source_location_id = ship_from["LocationID"]
+				break
+		if not delivery.source_location_id:
+			delivery.source_location_id = (
+				_byd_node(sales_order_data.get("SalesUnitParty")).get("PartyID")
+				or _byd_node(sales_order_data.get("SellerParty")).get("PartyID")
+				or ""
+			)
+		if delivery.source_location_id:
+			location = RESTServices().get_location_by_id(delivery.source_location_id)
+			delivery.source_location_name = (
+				location.get("Name") if location and location.get("Name")
+				else f"Warehouse {delivery.source_location_id}"
+			)
+
+		# Destination store - on current intracompany transfers BuyerParty is the
+		# company itself (FC-0001) and the store is the ProductRecipientParty
+		# (header, then item); older orders carry the store's customer account
+		# as BuyerParty, so that is tried last.
+		candidate_codes = []
+		for party in (
+			_byd_node(sales_order_data.get("ProductRecipientParty")),
+			*(_byd_node(item.get("ItemProductRecipientParty")) for item in items),
+			_byd_node(sales_order_data.get("BuyerParty")),
+		):
+			code = party.get("PartyID")
+			if code and code not in candidate_codes:
+				candidate_codes.append(code)
+		if not candidate_codes:
+			raise ValidationError(
+				f"Destination store PartyID missing from sales order {delivery.sales_order_reference}"
+			)
+		delivery.destination_store = None
+		for code in candidate_codes:
+			try:
+				delivery.destination_store = cls._find_store_by_identifier(code)
+				break
+			except Store.DoesNotExist:
+				continue
+		if delivery.destination_store is None:
+			raise ValidationError(
+				f"Destination store not found for sales order "
+				f"{delivery.sales_order_reference}: tried {', '.join(candidate_codes)}"
+			)
+
+		delivery.metadata = sales_order_data
+
+		try:
+			delivery.save()
+
+			# CancellationStatusCode 4 = Canceled - nothing will ship for it.
+			active_items = [i for i in items if str(i.get("CancellationStatusCode", "")) != "4"]
+			if active_items:
+				delivery.__create_line_items__(active_items)
+
+			logger.info(
+				f"Created expected receipt for sales order {delivery.sales_order_reference} "
+				f"from {delivery.source_location_id} to store {delivery.destination_store.store_name}"
+			)
+			return delivery
+		except IntegrityError as e:
+			logger.error(f"Error creating receipt for sales order {delivery.sales_order_reference}: {e}")
+			raise ValidationError(f"Error creating receipt: {e}")
+
 	@staticmethod
 	def _find_store_by_identifier(identifier):
 		from django.db.models import Q
@@ -218,25 +415,48 @@ class InboundDelivery(models.Model):
 		for item_data in line_items_data:
 			line_item = InboundDeliveryLineItem()
 			line_item.delivery = self
+			# On a sales order the product sits under ItemProduct; on an outbound
+			# delivery it is on the item itself.
+			item_product = item_data.get("ItemProduct") or {}
+
 			line_item.object_id = item_data.get("ObjectID", "")
-			line_item.product_id = item_data.get("ProductID", "")
+			line_item.product_id = item_data.get("ProductID") or item_product.get("ProductID", "")
 
 			# For product name, try to get from ProductDescription or Description (from product details) or construct from ProductID
 			line_item.product_name = (
 				item_data.get("ProductDescription") or
 				item_data.get("Description") or
-				item_data.get("ProductID", "Unknown Product")
+				item_product.get("ProductDescription") or
+				item_product.get("Description") or
+				line_item.product_id or
+				"Unknown Product"
 			)
 
-			# Extract quantity from ItemDeliveryQuantity
-			item_delivery_quantity = item_data.get("ItemDeliveryQuantity", {})
+			# Quantity: outbound deliveries carry ItemDeliveryQuantity; sales orders
+			# carry the intended ship quantity on ItemScheduleLine.
+			item_delivery_quantity = _byd_node(item_data.get("ItemDeliveryQuantity"))
+			schedule_line = _pick_schedule_line(_byd_results(item_data.get("ItemScheduleLine")))
+
 			if item_delivery_quantity:
 				quantity = item_delivery_quantity.get("Quantity", "0")
 				unit_code = item_delivery_quantity.get("UnitCode", "")
 				unit_text = item_delivery_quantity.get("UnitCodeText", unit_code)
+			elif schedule_line:
+				quantity = schedule_line.get("Quantity", "0")
+				# khsalesorder spells the unit with a lowercase u: "unitCode".
+				unit_code = (
+					schedule_line.get("unitCode")
+					or schedule_line.get("QuantityUnitCode")
+					or schedule_line.get("UnitCode", "")
+				)
+				unit_text = (
+					schedule_line.get("unitCodeText")
+					or schedule_line.get("QuantityUnitCodeText")
+					or unit_code
+				)
 			else:
 				# Fallback to direct quantity field
-				quantity = item_data.get("Quantity", "0")
+				quantity = item_data.get("RequestedQuantity") or item_data.get("Quantity", "0")
 				unit_code = item_data.get("QuantityUnitCode", "")
 				unit_text = unit_code
 
@@ -262,7 +482,9 @@ class InboundDelivery(models.Model):
 			line_item.save()
 	
 	def __str__(self):
-		return f"Delivery {self.delivery_id} - Warehouse {self.source_location_id} to {self.destination_store.store_name}"
+		# delivery_id is empty until SCD approval creates the outbound delivery.
+		reference = self.delivery_id or f"SO {self.sales_order_reference}"
+		return f"{reference} - Warehouse {self.source_location_id} to {self.destination_store.store_name}"
 	
 	class Meta:
 		verbose_name = "Inbound Delivery"
@@ -358,7 +580,11 @@ class TransferReceiptNote(models.Model):
 		"""
 		if not self.receipt_number:
 			count = TransferReceiptNote.objects.filter(inbound_delivery=self.inbound_delivery).count()
-			self.receipt_number = f"{self.inbound_delivery.delivery_id}{count + 1}"
+			# Sales-order receipts (eGRN 2) have no delivery_id until SCD approval
+			# creates the outbound delivery, so number them off the sales order.
+			prefix = self.inbound_delivery.delivery_id or self.inbound_delivery.sales_order_reference
+			prefix = ''.join(ch for ch in str(prefix or '') if ch.isdigit()) or str(self.inbound_delivery.id)
+			self.receipt_number = f"{prefix}{count + 1}"
 
 		super().save(*args, **kwargs)
 		return self

@@ -110,6 +110,15 @@ UNFOLD = {
 	},
 }
 
+# eGRN 2 step 3 - creating outbound deliveries in ByD on SCD approval.
+# ItemPostGoodsIssue moves real stock, so it is off unless explicitly enabled.
+BYD_AUTO_POST_GOODS_ISSUE = os.getenv('BYD_AUTO_POST_GOODS_ISSUE', 'false').lower() == 'true'
+# What to do when the store received less than the sales order's open quantity
+# (the ByD action has no quantity parameter and ships the full open quantity):
+#   'hold'      keep the receipt unsynced for manual handling (default)
+#   'post_full' post the full open quantity and record the shortfall on the receipt
+BYD_SHORT_RECEIPT_POLICY = os.getenv('BYD_SHORT_RECEIPT_POLICY', 'hold')
+
 Q_CLUSTER = {
 	'name': 'vimp_workers',
 	'orm': 'default',
