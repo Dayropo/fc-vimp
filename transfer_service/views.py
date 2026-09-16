@@ -549,13 +549,11 @@ def approve_delivery_receipt(request, receipt_id):
 			receipt.approved_by = request.user
 			receipt.save()
 
-			# Update delivery status based on whether fully received
+			# A sales order is received once (see TransferReceiptNoteSerializer),
+			# so SCD approval closes the delivery regardless of received quantity.
 			inbound_delivery = receipt.inbound_delivery
 			inbound_delivery.refresh_from_db()
-			if inbound_delivery.is_fully_received:
-				inbound_delivery.delivery_status_code = '3'  # Completed
-			else:
-				inbound_delivery.delivery_status_code = '2'  # In Process
+			inbound_delivery.delivery_status_code = '3'  # Completed
 			inbound_delivery.save()
 
 			# Trigger SAP ByD sync asynchronously
