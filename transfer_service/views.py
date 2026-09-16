@@ -542,15 +542,6 @@ def approve_delivery_receipt(request, receipt_id):
 				message=f"Receipt cannot be approved in status: {receipt.approval_status}"
 			)
 
-		# PPU/SCD supervisor must explicitly declare whether the delivery is complete
-		# or still in progress, rather than leaving it in an inferred default status.
-		is_completed = request.data.get('isCompleted')
-		if not isinstance(is_completed, bool):
-			return APIResponse(
-				status=status.HTTP_400_BAD_REQUEST,
-				message="'isCompleted' is required and must be true or false"
-			)
-
 		with transaction.atomic():
 			# Update receipt to approved status
 			receipt.approval_status = 'approved'
@@ -558,11 +549,11 @@ def approve_delivery_receipt(request, receipt_id):
 			receipt.approved_by = request.user
 			receipt.save()
 
-			# Delivery status is the supervisor's explicit decision (isCompleted),
-			# not inferred from received quantity.
+			# A sales order is received once (see TransferReceiptNoteSerializer),
+			# so SCD approval closes the delivery regardless of received quantity.
 			inbound_delivery = receipt.inbound_delivery
 			inbound_delivery.refresh_from_db()
-			inbound_delivery.delivery_status_code = '3' if is_completed else '2'  # 3=Completed, 2=In Process
+			inbound_delivery.delivery_status_code = '3'  # Completed
 			inbound_delivery.save()
 
 			# Trigger SAP ByD sync asynchronously
